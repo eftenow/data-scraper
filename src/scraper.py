@@ -6,6 +6,7 @@ import json
 import re
 import time
 from collections import deque
+from html import unescape as html_unescape
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Optional
@@ -54,6 +55,24 @@ def dedupe_preserve_order(items: list[str]) -> list[str]:
 def extract_video_urls(soup: BeautifulSoup, page_url: str) -> list[str]:
     found = []
 
+
+    for node in soup.find_all(attrs={"data-attributes": True}):
+        raw = node.get("data-attributes")
+        if not raw:
+            continue
+        try:
+            payload = json.loads(html_unescape(raw))
+        except json.JSONDecodeError:
+            continue
+
+        source = payload.get("source")
+        if isinstance(source, str) and source.strip():
+            found.append(canonicalize_url(urljoin(page_url, source.strip())))
+        elif isinstance(source, list):
+            for s in source:
+                if isinstance(s, str) and s.strip():
+                    found.append(canonicalize_url(urljoin(page_url, s.strip())))
+
     for node in soup.find_all("video"):
         src = node.get("src")
         if src:
@@ -67,13 +86,18 @@ def extract_video_urls(soup: BeautifulSoup, page_url: str) -> list[str]:
 
     for node in soup.find_all("a", href=True):
         href = canonicalize_url(urljoin(page_url, node["href"]))
-        if looks_like_video_url(href):
+        if looks_like_video_url(href) or any(
+            provider in href for provider in ("youtube.com", "youtu.be", "vimeo.com", "dailymotion.com")
+        ):
             found.append(href)
 
-    for node in soup.find_all("iframe", src=True):
-        src = canonicalize_url(urljoin(page_url, node["src"]))
-        if any(provider in src for provider in ("youtube.com", "youtu.be", "vimeo.com", "dailymotion.com")):
-            found.append(src)
+    for node in soup.find_all("iframe"):
+        src = node.get("src") or node.get("data-src") or node.get("data-lazy-src")
+        if not src:
+            continue
+        absolute = canonicalize_url(urljoin(page_url, src))
+        if any(provider in absolute for provider in ("youtube.com", "youtu.be", "vimeo.com", "dailymotion.com")):
+            found.append(absolute)
 
     return [url for url in dedupe_preserve_order(found) if is_http_url(url)]
 
