@@ -6,6 +6,7 @@ import json
 import re
 import time
 from collections import deque
+from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin, urldefrag, urlparse
@@ -125,6 +126,13 @@ def should_visit(
     return True
 
 
+def apply_cookie_string(session: requests.Session, cookie_string: str) -> None:
+    cookie = SimpleCookie()
+    cookie.load(cookie_string)
+    for morsel in cookie.values():
+        session.cookies.set(morsel.key, morsel.value)
+
+
 def infer_video_suffix(video_url: str, content_type: str) -> str:
     path = urlparse(video_url).path.lower()
     for ext in VIDEO_EXTENSIONS:
@@ -181,6 +189,8 @@ def run_crawl(
     include_regex: Optional[str],
     exclude_regex: Optional[str],
     user_agent: str,
+    cookie_string: Optional[str],
+    cookie_file: Optional[Path],
     download_videos: bool,
     max_videos_per_page: int,
     max_video_mb: int,
@@ -203,6 +213,12 @@ def run_crawl(
 
     session = requests.Session()
     session.headers.update({"User-Agent": user_agent})
+    if cookie_file:
+        cookie_text = cookie_file.read_text(encoding="utf-8").strip()
+        if cookie_text:
+            apply_cookie_string(session, cookie_text)
+    if cookie_string:
+        apply_cookie_string(session, cookie_string)
 
     queue = deque([canonicalize_url(start_url)])
     enqueued = {canonicalize_url(start_url)}
@@ -409,6 +425,16 @@ def parse_args() -> argparse.Namespace:
         help="Custom user agent for requests.",
     )
     parser.add_argument(
+        "--cookie",
+        default=None,
+        help="Cookie header string to use for authenticated crawling.",
+    )
+    parser.add_argument(
+        "--cookie-file",
+        default=None,
+        help="Path to a file containing a Cookie header string.",
+    )
+    parser.add_argument(
         "--download-videos",
         action="store_true",
         help="Download direct video files (.mp4/.webm/etc.) when found.",
@@ -439,6 +465,8 @@ def main() -> None:
         include_regex=args.include_regex,
         exclude_regex=args.exclude_regex,
         user_agent=args.user_agent,
+        cookie_string=args.cookie,
+        cookie_file=Path(args.cookie_file) if args.cookie_file else None,
         download_videos=args.download_videos,
         max_videos_per_page=args.max_videos_per_page,
         max_video_mb=args.max_video_mb,
