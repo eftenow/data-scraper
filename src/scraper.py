@@ -10,17 +10,40 @@ from html import unescape as html_unescape
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urljoin, urldefrag, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse, urldefrag
 
 import requests
 from bs4 import BeautifulSoup
 
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".m4v", ".mov", ".ogv")
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+TRACKING_QUERY_PARAMS = {
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_term",
+    "utm_content",
+    "gclid",
+    "fbclid",
+    "mc_cid",
+    "mc_eid",
+}
 
 
-def canonicalize_url(url: str) -> str:
+def canonicalize_url(url: str, keep_query_params: bool = False) -> str:
     cleaned, _fragment = urldefrag(url)
-    return cleaned.strip()
+    parsed = urlparse(cleaned.strip())
+
+    query = ""
+    if keep_query_params and parsed.query:
+        pairs = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k not in TRACKING_QUERY_PARAMS]
+        query = urlencode(pairs, doseq=True)
+
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+
+    return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", query, ""))
 
 
 def is_http_url(url: str) -> bool:
@@ -55,7 +78,6 @@ def dedupe_preserve_order(items: list[str]) -> list[str]:
 def extract_video_urls(soup: BeautifulSoup, page_url: str) -> list[str]:
     found = []
 
-
     for node in soup.find_all(attrs={"data-attributes": True}):
         raw = node.get("data-attributes")
         if not raw:
@@ -67,25 +89,25 @@ def extract_video_urls(soup: BeautifulSoup, page_url: str) -> list[str]:
 
         source = payload.get("source")
         if isinstance(source, str) and source.strip():
-            found.append(canonicalize_url(urljoin(page_url, source.strip())))
+            found.append(canonicalize_url(urljoin(page_url, source.strip()), keep_query_params=True))
         elif isinstance(source, list):
             for s in source:
                 if isinstance(s, str) and s.strip():
-                    found.append(canonicalize_url(urljoin(page_url, s.strip())))
+                    found.append(canonicalize_url(urljoin(page_url, s.strip()), keep_query_params=True))
 
     for node in soup.find_all("video"):
         src = node.get("src")
         if src:
-            found.append(canonicalize_url(urljoin(page_url, src)))
+            found.append(canonicalize_url(urljoin(page_url, src), keep_query_params=True))
 
     for node in soup.find_all("source"):
         src = node.get("src")
         src_type = (node.get("type") or "").lower()
         if src and (src_type.startswith("video/") or looks_like_video_url(src)):
-            found.append(canonicalize_url(urljoin(page_url, src)))
+            found.append(canonicalize_url(urljoin(page_url, src), keep_query_params=True))
 
     for node in soup.find_all("a", href=True):
-        href = canonicalize_url(urljoin(page_url, node["href"]))
+        href = canonicalize_url(urljoin(page_url, node["href"]), keep_query_params=True)
         if looks_like_video_url(href) or any(
             provider in href for provider in ("youtube.com", "youtu.be", "vimeo.com", "dailymotion.com")
         ):
@@ -95,14 +117,14 @@ def extract_video_urls(soup: BeautifulSoup, page_url: str) -> list[str]:
         src = node.get("src") or node.get("data-src") or node.get("data-lazy-src")
         if not src:
             continue
-        absolute = canonicalize_url(urljoin(page_url, src))
+        absolute = canonicalize_url(urljoin(page_url, src), keep_query_params=True)
         if any(provider in absolute for provider in ("youtube.com", "youtu.be", "vimeo.com", "dailymotion.com")):
             found.append(absolute)
 
     return [url for url in dedupe_preserve_order(found) if is_http_url(url)]
 
 
-def parse_html(url: str, html: str) -> dict:
+def parse_html(url: str, html: str, keep_query_params: bool) -> dict:
     soup = BeautifulSoup(html, "lxml")
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
     desc_tag = soup.find("meta", attrs={"name": re.compile(r"^description$", re.I)})
@@ -113,7 +135,7 @@ def parse_html(url: str, html: str) -> dict:
 
     links = []
     for node in soup.find_all("a", href=True):
-        absolute = canonicalize_url(urljoin(url, node["href"]))
+        absolute = canonicalize_url(urljoin(url, node["href"]), keep_query_params=keep_query_params)
         if is_http_url(absolute):
             links.append(absolute)
 
@@ -138,6 +160,7 @@ def should_visit(
     root_domain: str,
     include_pattern: Optional[re.Pattern],
     exclude_pattern: Optional[re.Pattern],
+    skip_noise: bool,
 ) -> bool:
     if not is_http_url(url):
         return False
@@ -147,6 +170,22 @@ def should_visit(
         return False
     if exclude_pattern and exclude_pattern.search(url):
         return False
+
+    if skip_noise:
+        path = urlparse(url).path.lower()
+        if any(
+            token in path
+            for token in (
+                "/wp-admin",
+                "/wp-login.php",
+                "/xmlrpc.php",
+                "/feed",
+                "/comments",
+                "/logout",
+                "/replytocom",
+            )
+        ):
+            return False
     return True
 
 
@@ -155,6 +194,33 @@ def apply_cookie_string(session: requests.Session, cookie_string: str) -> None:
     cookie.load(cookie_string)
     for morsel in cookie.values():
         session.cookies.set(morsel.key, morsel.value)
+
+
+def fetch_with_retries(
+    session: requests.Session,
+    url: str,
+    timeout_seconds: float,
+    max_retries: int,
+    retry_backoff: float,
+) -> tuple[Optional[int], str, str]:
+    last_error = ""
+    for attempt in range(max_retries + 1):
+        try:
+            response = session.get(url, timeout=timeout_seconds)
+            status_code = response.status_code
+            if status_code in RETRYABLE_STATUS_CODES and attempt < max_retries:
+                time.sleep(retry_backoff * (2**attempt))
+                continue
+            response.raise_for_status()
+            return status_code, response.text, ""
+        except requests.RequestException as exc:
+            last_error = str(exc)
+            if attempt < max_retries:
+                time.sleep(retry_backoff * (2**attempt))
+                continue
+            return None, "", last_error
+
+    return None, "", last_error
 
 
 def infer_video_suffix(video_url: str, content_type: str) -> str:
@@ -177,44 +243,83 @@ def download_video(
     videos_dir: Path,
     timeout_seconds: float,
     max_video_mb: int,
+    max_retries: int,
+    retry_backoff: float,
 ) -> tuple[str, str]:
     max_bytes = max_video_mb * 1024 * 1024
+    last_error = ""
 
-    try:
-        with session.get(video_url, timeout=timeout_seconds, stream=True) as response:
-            response.raise_for_status()
-            content_type = (response.headers.get("Content-Type") or "").lower()
-            suffix = infer_video_suffix(video_url, content_type)
-            output_path = videos_dir / to_filename(video_url, suffix)
+    for attempt in range(max_retries + 1):
+        try:
+            with session.get(video_url, timeout=timeout_seconds, stream=True) as response:
+                if response.status_code in RETRYABLE_STATUS_CODES and attempt < max_retries:
+                    time.sleep(retry_backoff * (2**attempt))
+                    continue
+                response.raise_for_status()
+                content_type = (response.headers.get("Content-Type") or "").lower()
+                suffix = infer_video_suffix(video_url, content_type)
+                output_path = videos_dir / to_filename(video_url, suffix)
 
-            total = 0
-            with output_path.open("wb") as out_f:
-                for chunk in response.iter_content(chunk_size=1024 * 64):
-                    if not chunk:
-                        continue
-                    total += len(chunk)
-                    if total > max_bytes:
-                        out_f.close()
-                        output_path.unlink(missing_ok=True)
-                        return "", f"video exceeds max size ({max_video_mb} MB)"
-                    out_f.write(chunk)
+                total = 0
+                with output_path.open("wb") as out_f:
+                    for chunk in response.iter_content(chunk_size=1024 * 64):
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > max_bytes:
+                            out_f.close()
+                            output_path.unlink(missing_ok=True)
+                            return "", f"video exceeds max size ({max_video_mb} MB)"
+                        out_f.write(chunk)
 
-            return str(output_path), ""
-    except requests.RequestException as exc:
-        return "", str(exc)
+                return str(output_path), ""
+        except requests.RequestException as exc:
+            last_error = str(exc)
+            if attempt < max_retries:
+                time.sleep(retry_backoff * (2**attempt))
+                continue
+            return "", last_error
+
+    return "", last_error
+
+
+def load_existing_visited(index_path: Path) -> set[str]:
+    visited = set()
+    if not index_path.exists():
+        return visited
+
+    with index_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                url = obj.get("url")
+                if url:
+                    visited.add(url)
+            except json.JSONDecodeError:
+                continue
+    return visited
 
 
 def run_crawl(
     start_url: str,
     out_dir: Path,
     max_pages: int,
+    max_depth: int,
     delay_seconds: float,
     timeout_seconds: float,
+    max_retries: int,
+    retry_backoff: float,
     include_regex: Optional[str],
     exclude_regex: Optional[str],
     user_agent: str,
     cookie_string: Optional[str],
     cookie_file: Optional[Path],
+    keep_query_params: bool,
+    skip_noise_urls: bool,
+    resume: bool,
     download_videos: bool,
     max_videos_per_page: int,
     max_video_mb: int,
@@ -244,15 +349,28 @@ def run_crawl(
     if cookie_string:
         apply_cookie_string(session, cookie_string)
 
-    queue = deque([canonicalize_url(start_url)])
-    enqueued = {canonicalize_url(start_url)}
-    visited = set()
+    start_url = canonicalize_url(start_url, keep_query_params=keep_query_params)
+    queue = deque([(start_url, 0)])
+    enqueued = {start_url}
+    visited = load_existing_visited(index_path) if resume else set()
     crawled = 0
 
-    with index_path.open("w", encoding="utf-8") as index_f, parsed_jsonl_path.open(
-        "w", encoding="utf-8"
-    ) as parsed_jsonl_f, parsed_csv_path.open("w", encoding="utf-8", newline="") as parsed_csv_f, video_manifest_path.open(
-        "w", encoding="utf-8", newline=""
+    mode = "a" if resume else "w"
+    write_headers = not (resume and parsed_csv_path.exists() and video_manifest_path.exists())
+
+    stats = {
+        "queued": 1,
+        "skipped_depth": 0,
+        "skipped_filter": 0,
+        "errors": 0,
+        "video_found": 0,
+        "video_downloaded": 0,
+    }
+
+    with index_path.open(mode, encoding="utf-8") as index_f, parsed_jsonl_path.open(
+        mode, encoding="utf-8"
+    ) as parsed_jsonl_f, parsed_csv_path.open(mode, encoding="utf-8", newline="") as parsed_csv_f, video_manifest_path.open(
+        mode, encoding="utf-8", newline=""
     ) as video_manifest_f:
         csv_writer = csv.DictWriter(
             parsed_csv_f,
@@ -271,8 +389,6 @@ def run_crawl(
                 "error",
             ],
         )
-        csv_writer.writeheader()
-
         video_writer = csv.DictWriter(
             video_manifest_f,
             fieldnames=[
@@ -283,28 +399,32 @@ def run_crawl(
                 "error",
             ],
         )
-        video_writer.writeheader()
+
+        if write_headers:
+            csv_writer.writeheader()
+            video_writer.writeheader()
 
         while queue and crawled < max_pages:
-            url = queue.popleft()
+            url, depth = queue.popleft()
             if url in visited:
                 continue
             visited.add(url)
 
-            if not should_visit(url, root_domain, include_pattern, exclude_pattern):
+            if depth > max_depth:
+                stats["skipped_depth"] += 1
                 continue
 
-            status_code = None
-            error = ""
-            html = ""
+            if not should_visit(url, root_domain, include_pattern, exclude_pattern, skip_noise_urls):
+                stats["skipped_filter"] += 1
+                continue
 
-            try:
-                response = session.get(url, timeout=timeout_seconds)
-                status_code = response.status_code
-                response.raise_for_status()
-                html = response.text
-            except requests.RequestException as exc:
-                error = str(exc)
+            status_code, html, error = fetch_with_retries(
+                session=session,
+                url=url,
+                timeout_seconds=timeout_seconds,
+                max_retries=max_retries,
+                retry_backoff=retry_backoff,
+            )
 
             raw_file = raw_dir / to_filename(url, ".html")
             if html:
@@ -316,6 +436,7 @@ def run_crawl(
                 "raw_html_path": str(raw_file),
                 "error": error,
                 "scraped_at_unix": int(time.time()),
+                "depth": depth,
             }
             index_f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -337,14 +458,18 @@ def run_crawl(
             }
 
             if html:
-                parsed.update(parse_html(url, html))
+                parsed.update(parse_html(url, html, keep_query_params=keep_query_params))
+                stats["video_found"] += parsed["video_count"]
 
-                for next_url in parsed["links"]:
-                    if next_url not in enqueued and next_url not in visited:
-                        queue.append(next_url)
-                        enqueued.add(next_url)
+                next_depth = depth + 1
+                if next_depth <= max_depth:
+                    for next_url in parsed["links"]:
+                        if next_url not in enqueued and next_url not in visited:
+                            queue.append((next_url, next_depth))
+                            enqueued.add(next_url)
+                            stats["queued"] += 1
 
-                downloadable_videos = [video_url for video_url in parsed["video_urls"] if looks_like_video_url(video_url)]
+                downloadable_videos = {video_url for video_url in parsed["video_urls"] if looks_like_video_url(video_url)}
                 for idx, video_url in enumerate(parsed["video_urls"]):
                     should_download = download_videos and idx < max_videos_per_page and video_url in downloadable_videos
                     downloaded_file_path = ""
@@ -356,9 +481,12 @@ def run_crawl(
                             videos_dir=videos_dir,
                             timeout_seconds=timeout_seconds,
                             max_video_mb=max_video_mb,
+                            max_retries=max_retries,
+                            retry_backoff=retry_backoff,
                         )
                         if downloaded_file_path:
                             parsed["downloaded_video_count"] += 1
+                            stats["video_downloaded"] += 1
 
                     video_writer.writerow(
                         {
@@ -369,6 +497,9 @@ def run_crawl(
                             "error": video_error,
                         }
                     )
+
+            if error:
+                stats["errors"] += 1
 
             parsed_jsonl_f.write(json.dumps(parsed, ensure_ascii=False) + "\n")
             csv_writer.writerow(
@@ -390,7 +521,7 @@ def run_crawl(
 
             crawled += 1
             print(
-                f"[{crawled}/{max_pages}] {url} status={status_code} videos={parsed['video_count']} "
+                f"[{crawled}/{max_pages}] depth={depth} {url} status={status_code} videos={parsed['video_count']} "
                 f"downloaded={parsed['downloaded_video_count']} error={bool(error)}"
             )
             time.sleep(delay_seconds)
@@ -403,6 +534,14 @@ def run_crawl(
     print(f"Raw pages:           {raw_dir}")
     if download_videos:
         print(f"Downloaded videos:   {videos_dir}")
+    print("\nSummary:")
+    print(f"  pages_crawled:     {crawled}")
+    print(f"  urls_queued:       {stats['queued']}")
+    print(f"  skipped_depth:     {stats['skipped_depth']}")
+    print(f"  skipped_filter:    {stats['skipped_filter']}")
+    print(f"  errors:            {stats['errors']}")
+    print(f"  videos_found:      {stats['video_found']}")
+    print(f"  videos_downloaded: {stats['video_downloaded']}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -422,6 +561,12 @@ def parse_args() -> argparse.Namespace:
         help="Max number of pages to crawl (default: 100).",
     )
     parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=3,
+        help="Max link depth from seed page (default: 3).",
+    )
+    parser.add_argument(
         "--delay",
         type=float,
         default=0.5,
@@ -432,6 +577,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=15.0,
         help="HTTP timeout per request in seconds (default: 15).",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=2,
+        help="Retry attempts for request failures (default: 2).",
+    )
+    parser.add_argument(
+        "--retry-backoff",
+        type=float,
+        default=1.0,
+        help="Base backoff in seconds for retries (default: 1.0).",
     )
     parser.add_argument(
         "--include-regex",
@@ -459,6 +616,21 @@ def parse_args() -> argparse.Namespace:
         help="Path to a file containing a Cookie header string.",
     )
     parser.add_argument(
+        "--keep-query-params",
+        action="store_true",
+        help="Keep query parameters in crawled page URLs (default strips most to reduce duplicates).",
+    )
+    parser.add_argument(
+        "--no-skip-noise-urls",
+        action="store_true",
+        help="Disable built-in filtering for obvious noise URLs (login/logout/feed/wp-admin/comment links).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Append to existing outputs and skip already indexed URLs.",
+    )
+    parser.add_argument(
         "--download-videos",
         action="store_true",
         help="Download direct video files (.mp4/.webm/etc.) when found.",
@@ -481,16 +653,22 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     run_crawl(
-        start_url=canonicalize_url(args.start_url),
+        start_url=canonicalize_url(args.start_url, keep_query_params=args.keep_query_params),
         out_dir=Path(args.out_dir),
         max_pages=args.max_pages,
+        max_depth=args.max_depth,
         delay_seconds=args.delay,
         timeout_seconds=args.timeout,
+        max_retries=args.max_retries,
+        retry_backoff=args.retry_backoff,
         include_regex=args.include_regex,
         exclude_regex=args.exclude_regex,
         user_agent=args.user_agent,
         cookie_string=args.cookie,
         cookie_file=Path(args.cookie_file) if args.cookie_file else None,
+        keep_query_params=args.keep_query_params,
+        skip_noise_urls=not args.no_skip_noise_urls,
+        resume=args.resume,
         download_videos=args.download_videos,
         max_videos_per_page=args.max_videos_per_page,
         max_video_mb=args.max_video_mb,
