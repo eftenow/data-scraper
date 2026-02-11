@@ -97,7 +97,8 @@ def build_catalog(out_dir: Path, seed_url: str) -> dict:
         raise SystemExit(f"Missing {video_manifest_path}")
 
     pages = read_jsonl(parsed_path)
-    page_by_url = {canonicalize_url(p["url"]): p for p in pages if p.get("url")}
+    page_by_url = {canonicalize_url(
+        p["url"]): p for p in pages if p.get("url")}
 
     seed_url = canonicalize_url(seed_url)
     seed = page_by_url.get(seed_url)
@@ -106,7 +107,8 @@ def build_catalog(out_dir: Path, seed_url: str) -> dict:
 
     seed_raw_path = Path(seed["raw_html_path"])
     intro_html = seed_raw_path.read_text(encoding="utf-8")
-    url_to_section, url_to_linktext, section_order = extract_intro_sections(intro_html, seed_url)
+    url_to_section, url_to_linktext, section_order = extract_intro_sections(
+        intro_html, seed_url)
 
     manifest = read_video_manifest(video_manifest_path)
     downloaded_by_page: dict[str, list[str]] = {}
@@ -114,7 +116,8 @@ def build_catalog(out_dir: Path, seed_url: str) -> dict:
         page_url = canonicalize_url(row.get("page_url") or "")
         downloaded = (row.get("downloaded_file_path") or "").strip()
         if page_url and downloaded:
-            downloaded_by_page.setdefault(page_url, []).append(rel_from_data(downloaded))
+            downloaded_by_page.setdefault(
+                page_url, []).append(rel_from_data(downloaded))
 
     items: list[PageItem] = []
     for url, p in page_by_url.items():
@@ -177,9 +180,80 @@ def build_catalog(out_dir: Path, seed_url: str) -> dict:
     }
 
 
+def write_catalog_csvs(catalog: dict, out_dir: Path) -> tuple[Path, Path]:
+    pages_csv = out_dir / "catalog_pages.csv"
+    videos_csv = out_dir / "catalog_videos.csv"
+
+    with pages_csv.open("w", encoding="utf-8", newline="") as f_pages, videos_csv.open(
+        "w", encoding="utf-8", newline=""
+    ) as f_videos:
+        pages_writer = csv.DictWriter(
+            f_pages,
+            fieldnames=[
+                "section",
+                "title",
+                "link_text",
+                "url",
+                "raw_html_rel",
+                "video_count",
+                "downloaded_video_count",
+                "has_downloaded_video",
+            ],
+        )
+        pages_writer.writeheader()
+
+        videos_writer = csv.DictWriter(
+            f_videos,
+            fieldnames=[
+                "section",
+                "page_title",
+                "page_url",
+                "video_url",
+                "downloaded_file_rel",
+                "is_downloaded",
+            ],
+        )
+        videos_writer.writeheader()
+
+        for section, items in catalog["sections"].items():
+            for item in items:
+                downloaded_files = item.get("downloaded_files_rel", []) or []
+                video_urls = item.get("video_urls", []) or []
+
+                pages_writer.writerow(
+                    {
+                        "section": section,
+                        "title": item.get("title", ""),
+                        "link_text": item.get("link_text", ""),
+                        "url": item.get("url", ""),
+                        "raw_html_rel": item.get("raw_html_rel", ""),
+                        "video_count": len(video_urls),
+                        "downloaded_video_count": len(downloaded_files),
+                        "has_downloaded_video": bool(downloaded_files),
+                    }
+                )
+
+                for idx, video_url in enumerate(video_urls):
+                    downloaded_file_rel = downloaded_files[idx] if idx < len(
+                        downloaded_files) else ""
+                    videos_writer.writerow(
+                        {
+                            "section": section,
+                            "page_title": item.get("title", ""),
+                            "page_url": item.get("url", ""),
+                            "video_url": video_url,
+                            "downloaded_file_rel": downloaded_file_rel,
+                            "is_downloaded": bool(downloaded_file_rel),
+                        }
+                    )
+
+    return pages_csv, videos_csv
+
+
 def render_index_html(catalog: dict) -> str:
     seed_url = catalog["seed_url"]
-    catalog_json = json.dumps(catalog, ensure_ascii=False).replace("<", "\\u003c")
+    catalog_json = json.dumps(
+        catalog, ensure_ascii=False).replace("<", "\\u003c")
 
     return r"""<!doctype html>
 <html lang="en">
@@ -395,7 +469,8 @@ def render_index_html(catalog: dict) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Build a structured catalog + offline index.html for scraped data.")
+    p = argparse.ArgumentParser(
+        description="Build a structured catalog + offline index.html for scraped data.")
     p.add_argument(
         "--out-dir",
         default="data",
@@ -413,10 +488,14 @@ def main() -> None:
     args = parse_args()
     out_dir = Path(args.out_dir)
     catalog = build_catalog(out_dir=out_dir, seed_url=args.seed_url)
-    (out_dir / "catalog.json").write_text(json.dumps(catalog, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "catalog.json").write_text(json.dumps(catalog,
+                                                     ensure_ascii=False, indent=2), encoding="utf-8")
     (out_dir / "index.html").write_text(render_index_html(catalog), encoding="utf-8")
+    pages_csv, videos_csv = write_catalog_csvs(catalog, out_dir)
     print(f"Wrote {out_dir / 'catalog.json'}")
     print(f"Wrote {out_dir / 'index.html'}")
+    print(f"Wrote {pages_csv}")
+    print(f"Wrote {videos_csv}")
 
 
 if __name__ == "__main__":

@@ -15,6 +15,13 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse, ur
 import requests
 from bs4 import BeautifulSoup
 
+try:
+    from build_catalog import build_catalog, render_index_html, write_catalog_csvs
+except Exception:
+    build_catalog = None
+    render_index_html = None
+    write_catalog_csvs = None
+
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".m4v", ".mov", ".ogv")
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 TRACKING_QUERY_PARAMS = {
@@ -36,7 +43,8 @@ def canonicalize_url(url: str, keep_query_params: bool = False) -> str:
 
     query = ""
     if keep_query_params and parsed.query:
-        pairs = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k not in TRACKING_QUERY_PARAMS]
+        pairs = [(k, v) for k, v in parse_qsl(parsed.query,
+                                              keep_blank_values=True) if k not in TRACKING_QUERY_PARAMS]
         query = urlencode(pairs, doseq=True)
 
     path = parsed.path or "/"
@@ -89,35 +97,42 @@ def extract_video_urls(soup: BeautifulSoup, page_url: str) -> list[str]:
 
         source = payload.get("source")
         if isinstance(source, str) and source.strip():
-            found.append(canonicalize_url(urljoin(page_url, source.strip()), keep_query_params=True))
+            found.append(canonicalize_url(
+                urljoin(page_url, source.strip()), keep_query_params=True))
         elif isinstance(source, list):
             for s in source:
                 if isinstance(s, str) and s.strip():
-                    found.append(canonicalize_url(urljoin(page_url, s.strip()), keep_query_params=True))
+                    found.append(canonicalize_url(
+                        urljoin(page_url, s.strip()), keep_query_params=True))
 
     for node in soup.find_all("video"):
         src = node.get("src")
         if src:
-            found.append(canonicalize_url(urljoin(page_url, src), keep_query_params=True))
+            found.append(canonicalize_url(
+                urljoin(page_url, src), keep_query_params=True))
 
     for node in soup.find_all("source"):
         src = node.get("src")
         src_type = (node.get("type") or "").lower()
         if src and (src_type.startswith("video/") or looks_like_video_url(src)):
-            found.append(canonicalize_url(urljoin(page_url, src), keep_query_params=True))
+            found.append(canonicalize_url(
+                urljoin(page_url, src), keep_query_params=True))
 
     for node in soup.find_all("a", href=True):
-        href = canonicalize_url(urljoin(page_url, node["href"]), keep_query_params=True)
+        href = canonicalize_url(
+            urljoin(page_url, node["href"]), keep_query_params=True)
         if looks_like_video_url(href) or any(
             provider in href for provider in ("youtube.com", "youtu.be", "vimeo.com", "dailymotion.com")
         ):
             found.append(href)
 
     for node in soup.find_all("iframe"):
-        src = node.get("src") or node.get("data-src") or node.get("data-lazy-src")
+        src = node.get("src") or node.get(
+            "data-src") or node.get("data-lazy-src")
         if not src:
             continue
-        absolute = canonicalize_url(urljoin(page_url, src), keep_query_params=True)
+        absolute = canonicalize_url(
+            urljoin(page_url, src), keep_query_params=True)
         if any(provider in absolute for provider in ("youtube.com", "youtu.be", "vimeo.com", "dailymotion.com")):
             found.append(absolute)
 
@@ -127,7 +142,8 @@ def extract_video_urls(soup: BeautifulSoup, page_url: str) -> list[str]:
 def parse_html(url: str, html: str, keep_query_params: bool) -> dict:
     soup = BeautifulSoup(html, "lxml")
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
-    desc_tag = soup.find("meta", attrs={"name": re.compile(r"^description$", re.I)})
+    desc_tag = soup.find(
+        "meta", attrs={"name": re.compile(r"^description$", re.I)})
     description = (desc_tag.get("content") or "").strip() if desc_tag else ""
     h1 = [node.get_text(" ", strip=True) for node in soup.find_all("h1")]
     h2 = [node.get_text(" ", strip=True) for node in soup.find_all("h2")]
@@ -135,7 +151,8 @@ def parse_html(url: str, html: str, keep_query_params: bool) -> dict:
 
     links = []
     for node in soup.find_all("a", href=True):
-        absolute = canonicalize_url(urljoin(url, node["href"]), keep_query_params=keep_query_params)
+        absolute = canonicalize_url(
+            urljoin(url, node["href"]), keep_query_params=keep_query_params)
         if is_http_url(absolute):
             links.append(absolute)
 
@@ -256,7 +273,8 @@ def download_video(
                     time.sleep(retry_backoff * (2**attempt))
                     continue
                 response.raise_for_status()
-                content_type = (response.headers.get("Content-Type") or "").lower()
+                content_type = (response.headers.get(
+                    "Content-Type") or "").lower()
                 suffix = infer_video_suffix(video_url, content_type)
                 output_path = videos_dir / to_filename(video_url, suffix)
 
@@ -323,6 +341,8 @@ def run_crawl(
     download_videos: bool,
     max_videos_per_page: int,
     max_video_mb: int,
+    auto_build_catalog: bool,
+    catalog_seed_url: Optional[str],
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     raw_dir = out_dir / "raw"
@@ -349,14 +369,16 @@ def run_crawl(
     if cookie_string:
         apply_cookie_string(session, cookie_string)
 
-    start_url = canonicalize_url(start_url, keep_query_params=keep_query_params)
+    start_url = canonicalize_url(
+        start_url, keep_query_params=keep_query_params)
     queue = deque([(start_url, 0)])
     enqueued = {start_url}
     visited = load_existing_visited(index_path) if resume else set()
     crawled = 0
 
     mode = "a" if resume else "w"
-    write_headers = not (resume and parsed_csv_path.exists() and video_manifest_path.exists())
+    write_headers = not (resume and parsed_csv_path.exists()
+                         and video_manifest_path.exists())
 
     stats = {
         "queued": 1,
@@ -458,7 +480,8 @@ def run_crawl(
             }
 
             if html:
-                parsed.update(parse_html(url, html, keep_query_params=keep_query_params))
+                parsed.update(parse_html(
+                    url, html, keep_query_params=keep_query_params))
                 stats["video_found"] += parsed["video_count"]
 
                 next_depth = depth + 1
@@ -469,7 +492,8 @@ def run_crawl(
                             enqueued.add(next_url)
                             stats["queued"] += 1
 
-                downloadable_videos = {video_url for video_url in parsed["video_urls"] if looks_like_video_url(video_url)}
+                downloadable_videos = {
+                    video_url for video_url in parsed["video_urls"] if looks_like_video_url(video_url)}
                 for idx, video_url in enumerate(parsed["video_urls"]):
                     should_download = download_videos and idx < max_videos_per_page and video_url in downloadable_videos
                     downloaded_file_path = ""
@@ -542,6 +566,30 @@ def run_crawl(
     print(f"  errors:            {stats['errors']}")
     print(f"  videos_found:      {stats['video_found']}")
     print(f"  videos_downloaded: {stats['video_downloaded']}")
+
+    if auto_build_catalog:
+        if build_catalog is None or render_index_html is None or write_catalog_csvs is None:
+            print("\nCatalog generation skipped: build_catalog module is not available.")
+            return
+
+        try:
+            seed_for_catalog = canonicalize_url(
+                catalog_seed_url or start_url, keep_query_params=keep_query_params)
+            catalog = build_catalog(out_dir=out_dir, seed_url=seed_for_catalog)
+            catalog_json_path = out_dir / "catalog.json"
+            catalog_index_path = out_dir / "index.html"
+            catalog_json_path.write_text(json.dumps(
+                catalog, ensure_ascii=False, indent=2), encoding="utf-8")
+            catalog_index_path.write_text(
+                render_index_html(catalog), encoding="utf-8")
+            pages_csv, videos_csv = write_catalog_csvs(catalog, out_dir)
+            print("\nCatalog:")
+            print(f"  index_html:         {catalog_index_path}")
+            print(f"  catalog_json:       {catalog_json_path}")
+            print(f"  catalog_pages_csv:  {pages_csv}")
+            print(f"  catalog_videos_csv: {videos_csv}")
+        except Exception as exc:
+            print(f"\nCatalog generation failed: {exc}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -631,6 +679,16 @@ def parse_args() -> argparse.Namespace:
         help="Append to existing outputs and skip already indexed URLs.",
     )
     parser.add_argument(
+        "--auto-build-catalog",
+        action="store_true",
+        help="Generate data/index.html, data/catalog.json, and sectioned CSVs after crawl.",
+    )
+    parser.add_argument(
+        "--catalog-seed-url",
+        default=None,
+        help="Seed URL used for catalog section grouping (defaults to start_url).",
+    )
+    parser.add_argument(
         "--download-videos",
         action="store_true",
         help="Download direct video files (.mp4/.webm/etc.) when found.",
@@ -653,7 +711,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     run_crawl(
-        start_url=canonicalize_url(args.start_url, keep_query_params=args.keep_query_params),
+        start_url=canonicalize_url(
+            args.start_url, keep_query_params=args.keep_query_params),
         out_dir=Path(args.out_dir),
         max_pages=args.max_pages,
         max_depth=args.max_depth,
@@ -672,6 +731,8 @@ def main() -> None:
         download_videos=args.download_videos,
         max_videos_per_page=args.max_videos_per_page,
         max_video_mb=args.max_video_mb,
+        auto_build_catalog=args.auto_build_catalog,
+        catalog_seed_url=args.catalog_seed_url,
     )
 
 
