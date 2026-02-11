@@ -31,10 +31,10 @@ python src/scraper.py https://example.com \
 ## Output
 
 - `data/raw/*.html`: raw page HTML
-- `data/crawl_index.jsonl`: crawl-level metadata
+- `data/crawl_index.jsonl`:  metadata
 - `data/parsed_records.jsonl`: parsed per-page records
 - `data/parsed_records.csv`: tabular export for BI tools
-
+- `data/videos`: videos contained
 
 ## Visualize scrped data
 
@@ -42,3 +42,14 @@ python src/scraper.py https://example.com \
 Open `data/parsed_records.csv` in Google Sheets, Excel, Tableau, Power BI, or Looker Studio.
 
 
+For authenticated crawls (auth-gated pages):
+
+- create a `auth_cookie.txt` file, and paste the cookie header value inside, so that the scraper can read it and use it, example use:
+
+```
+python src/scraper.py https://test.com/ \
+  --max-pages 200 \
+  --delay 1.0 \
+  --download-videos \
+  --cookie-file auth_cookie.txt
+```
